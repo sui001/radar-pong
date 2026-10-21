@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Radar Pong</title>
+<style>
+  :root { --a: #00e5ff; --b: #ffd400; --fg: #ffffff; --bg: #000; --warn: #ff5a5a; --ok: #4dff7a; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+               font: 15px/1.35 ui-monospace, Consolas, monospace; overflow: hidden; touch-action: none; }
+  #views { position: absolute; inset: 0 0 34px 0; display: flex; gap: 6px; }
+  .view { flex: 1; position: relative; min-width: 0; }
+  .view canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+  #bar { position: absolute; left: 0; right: 0; bottom: 0; height: 34px; display: flex; align-items: center;
+         gap: 14px; padding: 0 10px; background: #111; white-space: nowrap; overflow: hidden; }
+  #bar .a { color: var(--a); } #bar .b { color: var(--b); }
+  #bar .warn { color: var(--warn); }
+  #bar .grow { flex: 1; }
+  button { font: inherit; color: var(--fg); background: #222; border: 1px solid #fff; border-radius: 4px;
+           padding: 3px 9px; cursor: pointer; }
+  button.on { background: var(--ok); color: #000; }
+  #panel { position: absolute; right: 8px; bottom: 42px; width: min(420px, calc(100% - 16px)); max-height: calc(100% - 60px);
+           overflow: auto; background: #111; border: 2px solid #fff; border-radius: 6px; padding: 10px 12px; }
+  #panel[hidden] { display: none; }
+  #panel h3 { margin: 10px 0 4px; font-size: 15px; }
+  #panel h3.a { color: var(--a); } #panel h3.b { color: var(--b); }
+  #panel label { display: flex; justify-content: space-between; gap: 10px; margin: 3px 0; }
+  #panel input[type=number] { width: 90px; font: inherit; background: #000; color: #fff; border: 1px solid #fff; }
+  #panel .links a { color: var(--ok); margin-right: 10px; }
+  #panel p { margin: 4px 0; }
+</style>
+</head>
+<body>
+<div id="views"></div>
+<div id="bar">
+  <span id="sa" class="a"></span>
+  <span id="sb" class="b"></span>
+  <span id="mode"></span>
+  <span class="grow"></span>
+  <button id="sound">Sound</button>
+  <button id="gear">Settings</button>
+</div>
+<div id="panel" hidden>
+  <div class="links">Views: <a href="/a">A</a><a href="/b">B</a><a href="/split">split</a><a href="/watch">watch</a></div>
+  <p>Keys if no radar: A end <b>A D</b> (and <b>W S</b> for depth), B end <b>&larr; &rarr;</b> (<b>&uarr; &darr;</b>).
+     On a one-end page the arrows drive that end. Or drag on your court.</p>
+  <div id="gameFields"></div>
+  <h3 class="a">End A sensor</h3><div id="aFields"></div>
+  <h3 class="b">End B sensor</h3><div id="bFields"></div>
+  <p><button id="reset">Reset score</button></p>
+</div>
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const COL = { a: '#00e5ff', b: '#ffd400' };
+
+// ---------- which view ----------
+const path = location.pathname.replace(/\/$/, '') || '/split';
+const VIEWS = { '/a': ['a'], '/b': ['b'], '/split': ['a', 'b'], '/watch': ['w'] }[path] || ['a', 'b'];
+const OWN = VIEWS.length === 1 && VIEWS[0] !== 'w' ? VIEWS[0] : null;   // a one-end page
+document.title = 'Radar Pong ' + (OWN ? OWN.toUpperCase() : path.slice(1));
+const views = VIEWS.map(v => {
+  const div = document.createElement('div'); div.className = 'view';
+  const c = document.createElement('canvas'); div.appendChild(c); $('views').appendChild(div);
+  return { side: v === 'w' ? 'a' : v, watch: v === 'w', c, g: c.getContext('2d'), tf: null };
+});
+
+// ---------- state from the game ----------
+let S = null, recvT = 0, lastSeq = null;
+const es = new EventSource('/state');
+es.onmessage = e => {
+  S = JSON.parse(e.data); recvT = performance.now();
+  if (lastSeq === null) lastSeq = S.events.length ? S.events[S.events.length - 1][0] : 0;
+  for (const [seq, kind] of S.events) if (seq > lastSeq) { beep(kind); lastSeq = seq; }
+  if (!$('panel').hidden && !panelBuilt) buildPanel();
+};
+es.onerror = () => { S = null; };
+
+// ---------- court <-> screen ----------
+// court: x 0..1 across, y 0..L, A's end line at y = 0. Each view puts its own end at the top.
+function layout(v) {
+  const dpr = devicePixelRatio, W = v.c.clientWidth * dpr, H = v.c.clientHeight * dpr;
+  if (v.c.width !== W || v.c.height !== H) { v.c.width = W; v.c.height = H; }
+  const L = S ? S.L : 1.4, pad = 14 * dpr;
+  const s = Math.min((W - 2 * pad), (H - 2 * pad) / L);
+  v.tf = { s, ox: (W - s) / 2, oy: (H - s * L) / 2, L, W, H, dpr };
+}
+function toScreen(v, x, y) {
+  const t = v.tf;
+  if (v.side === 'b') { x = 1 - x; y = t.L - y; }
+  return [t.ox + x * t.s, t.oy + y * t.s];
+}
+function rect(v, x0, y0, x1, y1, col) {
+  const [ax, ay] = toScreen(v, x0, y0), [bx, by] = toScreen(v, x1, y1);
+  v.g.fillStyle = col;
+  v.g.fillRect(Math.min(ax, bx), Math.min(ay, by), Math.abs(bx - ax), Math.abs(by - ay));
+}
+
+// ---------- the old square font ----------
+const DIGITS = ['111101101101111', '010110010010111', '111001111100111', '111001111001111', '101101111001001',
+                '111100111001111', '111100111101111', '111001001001001', '111101111101111', '111101111001111'];
+function pixelNumber(g, n, cx, cy, px, col) {
+  const str = String(n); g.fillStyle = col;
+  const w = str.length * 4 * px - px;
+  [...str].forEach((ch, k) => {
+    const bits = DIGITS[+ch];
+    for (let i = 0; i < 15; i++) if (bits[i] === '1')
+      g.fillRect(cx - w / 2 + k * 4 * px + (i % 3) * px, cy - 2.5 * px + Math.floor(i / 3) * px, px, px);
+  });
+}
+
+// ---------- draw ----------
+function padRects(S, n) {
+  const st = S.settings, out = [];
+  const pads = S[n].pads.length ? S[n].pads : (S[n].ghost !== null ? [{ u: S[n].ghost, d: 0, ghost: true }] : []);
+  let w = st.paddleWidth;
+  if (st.teamShrink && S[n].pads.length > 1) w /= Math.sqrt(S[n].pads.length);
+  const wall = { squash_a: 'b', squash_b: 'a' }[S.mode];
+  if (wall === n) return { wall: true, pads: [] };
+  for (const p of pads) {
+    const d = st.depth ? p.d * st.zone * S.L : 0;
+    const cx = n === 'a' ? p.u : 1 - p.u;
+    const face = n === 'a' ? S.endGap + d : S.L - S.endGap - d;
+    const back = n === 'a' ? face - S.padT : face + S.padT;
+    out.push({ x0: cx - w / 2, x1: cx + w / 2, y0: back, y1: face, ghost: p.ghost, hands: p.slot === 'h' });
+  }
+  return { wall: false, pads: out };
+}
+
+function draw() {
+  requestAnimationFrame(draw);
+  for (const v of views) {
+    layout(v);
+    const g = v.g, t = v.tf, px = t.dpr;
+    g.fillStyle = '#000'; g.fillRect(0, 0, t.W, t.H);
+    if (!S) {
+      g.fillStyle = '#ff5a5a'; g.font = `${16 * px}px monospace`; g.textAlign = 'center';
+      g.fillText('no game server', t.W / 2, t.H / 2); continue;
+    }
+    const L = S.L, st = S.settings;
+    // court edges and net
+    g.strokeStyle = '#fff'; g.lineWidth = 2 * px;
+    const [x0, y0] = toScreen(v, 0, 0), [x1, y1] = toScreen(v, 1, L);
+    g.strokeRect(Math.min(x0, x1), Math.min(y0, y1), Math.abs(x1 - x0), Math.abs(y1 - y0));
+    for (let x = 0; x < 1; x += 0.05) rect(v, x + 0.01, L / 2 - 0.004, x + 0.035, L / 2 + 0.004, '#fff');
+    // depth zones, a thin line of each end's colour
+    if (st.depth) for (const n of ['a', 'b']) {
+      const y = n === 'a' ? S.endGap + st.zone * L : L - S.endGap - st.zone * L;
+      for (let x = 0; x < 1; x += 0.1) rect(v, x, y - 0.002, x + 0.04, y + 0.002, COL[n]);
+    }
+    // scores: each end's number in its own half
+    const big = Math.max(4, Math.round(t.s / 45));
+    if (S.mode === 'match' || S.mode === 'attract') for (const n of ['a', 'b']) {
+      const [sx, sy] = toScreen(v, 0.5, n === 'a' ? L * 0.4 : L * 0.6);   // near the net, clear of the depth zones
+      pixelNumber(g, S.score[n], sx, sy, big, COL[n]);
+    } else if (S.mode.startsWith('squash')) {
+      const [sx, sy] = toScreen(v, 0.5, L / 2 - 0.15 * (S.mode === 'squash_a' ? -1 : 1));
+      pixelNumber(g, S.rally, sx, sy, big, '#fff');
+    }
+    // paddles, or a wall where nobody is playing
+    for (const n of ['a', 'b']) {
+      const r = padRects(S, n);
+      if (r.wall) { const y = n === 'a' ? 0 : L; rect(v, 0, y - 0.012, 1, y + 0.012, COL[n]); }
+      for (const p of r.pads) {
+        rect(v, p.x0, p.y0, p.x1, p.y1, COL[n]);
+        if (p.ghost) rect(v, p.x0 + 0.006, Math.min(p.y0, p.y1) + 0.006, p.x1 - 0.006, Math.max(p.y0, p.y1) - 0.006, '#000');
+      }
+    }
+    // balls, carried forward from the last state so they do not stutter at 30 Hz
+    const dt = S.phase === 'play' ? Math.min(0.1, (performance.now() - recvT) / 1000) : 0;
+    const bs = st.ballSize;
+    for (const b of S.balls) {
+      const bx = Math.max(bs / 2, Math.min(1 - bs / 2, b.x + b.vx * dt)), by = b.y + b.vy * dt;
+      if (S.phase === 'serve' && (performance.now() / 250 | 0) % 2) continue;   // blink while waiting
+      rect(v, bx - bs / 2, by - bs / 2, bx + bs / 2, by + bs / 2, '#fff');
+    }
+    // the message
+    if (S.msg && S.phase !== 'play') {
+      g.font = `bold ${Math.round(t.s / 18)}px monospace`; g.textAlign = 'center'; g.fillStyle = '#fff';
+      const [mx, my] = toScreen(v, 0.5, L / 2);
+      g.fillText(S.msg.toUpperCase(), mx, my - t.s * 0.05);
+    }
+    // own end label and its radar
+    const me = v.side;
+    g.font = `bold ${Math.round(13 * px)}px monospace`; g.textAlign = 'left'; g.fillStyle = COL[me];
+    g.fillText(v.watch ? 'WATCH' : `END ${me.toUpperCase()}`, 6 * px, 16 * px);
+    if (!v.watch) drawRadar(v, me);
+  }
+}
+
+// a small top-down of this end's sensor: sensor at the top, the playing width boxed
+function drawRadar(v, n) {
+  const g = v.g, t = v.tf, px = t.dpr, side = S[n], cfg = side.cfg;
+  const w = Math.min(150 * px, t.W * 0.3), h = w * 0.6, ox = t.W - w - 6 * px, oy = 6 * px;
+  const span = Math.max(cfg.reach * 2.6, 4000), sc = w / span, depth = Math.max(cfg.far * 1.25, 3500);
+  const X = x => ox + w / 2 + x * sc * (cfg.mirror ? -1 : 1), Y = y => oy + y * (h / depth);
+  g.fillStyle = '#000'; g.fillRect(ox, oy, w, h);
+  g.strokeStyle = '#fff'; g.lineWidth = 1 * px; g.strokeRect(ox, oy, w, h);
+  g.strokeStyle = COL[n]; g.lineWidth = 2 * px;
+  g.strokeRect(X(cfg.centre - cfg.reach), Y(cfg.near), X(cfg.centre + cfg.reach) - X(cfg.centre - cfg.reach), Y(cfg.far) - Y(cfg.near));
+  g.fillStyle = '#fff'; g.fillRect(ox + w / 2 - 4 * px, oy, 8 * px, 3 * px);
+  for (const [x, y] of side.raw) {
+    g.beginPath(); g.arc(X(x), Y(Math.min(y, depth)), 3.5 * px, 0, 7); g.fillStyle = COL[n]; g.fill();
+  }
+}
+
+// ---------- status bar ----------
+setInterval(() => {
+  if (!S) { $('mode').textContent = 'no game server'; $('mode').className = 'warn'; return; }
+  for (const n of ['a', 'b']) {
+    const sd = S[n], el = $('s' + n);
+    const live = sd.pads.filter(p => p.slot !== 'h').length;
+    el.textContent = `${n.toUpperCase()}: ${live} ${live === 1 ? 'person' : 'people'}, ${sd.status}${sd.fps ? ' ' + sd.fps + ' fps' : ''}`;
+    el.className = /no stream|connecting/.test(sd.status) ? 'warn' : n;
+  }
+  $('mode').className = '';
+  $('mode').textContent = { match: `match to ${S.settings.winScore}`, attract: 'attract (nobody in)', waiting: 'waiting',
+                            squash_a: `squash, best ${S.best}`, squash_b: `squash, best ${S.best}` }[S.mode] +
+                          (S.rally > 1 && S.phase === 'play' ? `, rally ${S.rally}` : '');
+}, 300);
+
+// ---------- hands: keys and touch, when the radar is not there or for testing ----------
+const hand = { a: null, b: null };
+const keys = new Set();
+addEventListener('keydown', e => { keys.add(e.key.toLowerCase()); if (e.key.startsWith('Arrow')) e.preventDefault(); });
+addEventListener('keyup', e => keys.delete(e.key.toLowerCase()));
+const KEYMAP = OWN
+  ? { [OWN]: { l: ['arrowleft', 'a'], r: ['arrowright', 'd'], f: ['arrowdown', 's'], n: ['arrowup', 'w'] } }
+  : { a: { l: ['a'], r: ['d'], f: ['s'], n: ['w'] }, b: { l: ['arrowleft'], r: ['arrowright'], f: ['arrowdown'], n: ['arrowup'] } };
+let lastKeyT = performance.now();
+function keyStep() {
+  const now = performance.now(), dt = (now - lastKeyT) / 1000; lastKeyT = now;
+  for (const n in KEYMAP) {
+    const m = KEYMAP[n], down = ks => ks.some(k => keys.has(k));
+    const du = (down(m.r) ? 1 : 0) - (down(m.l) ? 1 : 0), dd = (down(m.f) ? 1 : 0) - (down(m.n) ? 1 : 0);
+    if (du || dd) {
+      hand[n] = hand[n] || { u: 0.5, d: 0 };
+      hand[n].u = Math.max(0, Math.min(1, hand[n].u + du * 1.4 * dt));
+      hand[n].d = Math.max(0, Math.min(1, hand[n].d + dd * 2.0 * dt));
+      hand[n].t = now;
+    }
+  }
+}
+for (const v of views) {
+  if (v.watch) continue;
+  const at = e => {
+    const r = v.c.getBoundingClientRect(), t = v.tf;
+    const sx = (e.clientX - r.left) * t.dpr, sy = (e.clientY - r.top) * t.dpr;
+    const u = (sx - t.ox) / t.s, y = (sy - t.oy) / t.s;   // in this view's own frame: own end at top
+    const d = S && S.settings.depth ? (y - S.endGap) / (S.settings.zone * S.L) : 0;
+    hand[v.side] = { u: Math.max(0, Math.min(1, u)), d: Math.max(0, Math.min(1, d)), t: performance.now() };
+  };
+  v.c.addEventListener('pointerdown', e => { v.c.setPointerCapture(e.pointerId); at(e); });
+  v.c.addEventListener('pointermove', e => { if (e.buttons || e.pointerType === 'touch') at(e); });
+}
+setInterval(() => {
+  keyStep();
+  for (const n of ['a', 'b']) {
+    const h = hand[n];
+    if (!h || performance.now() - h.t > 2000) continue;   // let go: the paddle leaves after a moment
+    fetch('/hands', { method: 'POST', body: JSON.stringify({ side: n, u: h.u, d: h.d }) }).catch(() => {});
+  }
+}, 50);
+
+// ---------- sound: square-wave beeps, the old way ----------
+let ac = null;
+$('sound').onclick = () => {
+  if (!ac) { ac = new AudioContext(); $('sound').classList.add('on'); }
+  else if (ac.state === 'running') { ac.suspend(); $('sound').classList.remove('on'); }
+  else { ac.resume(); $('sound').classList.add('on'); }
+};
+function tone(f, dur, at = 0, vol = 0.12) {
+  if (!ac || ac.state !== 'running') return;
+  const o = ac.createOscillator(), gn = ac.createGain(), t0 = ac.currentTime + at;
+  o.type = 'square'; o.frequency.value = f; gn.gain.value = vol;
+  gn.gain.setValueAtTime(vol, t0 + dur * 0.8); gn.gain.linearRampToValueAtTime(0, t0 + dur);
+  o.connect(gn).connect(ac.destination); o.start(t0); o.stop(t0 + dur);
+}
+function beep(kind) {
+  ({ hit: () => tone(460, 0.05), wall: () => tone(230, 0.05), smash: () => tone(920, 0.08, 0.02),
+     point: () => tone(120, 0.35), miss: () => tone(120, 0.35), serve: () => tone(700, 0.04),
+     multi: () => [520, 660, 780].forEach((f, i) => tone(f, 0.07, i * 0.07)),
+     win: () => [520, 660, 780, 1040].forEach((f, i) => tone(f, 0.12, i * 0.13)),
+     mode: () => tone(330, 0.06) }[kind] || (() => {}))();
+}
+
+// ---------- settings: shared with every page through the game server ----------
+let panelBuilt = false;
+const GAME_FIELDS = [
+  ['paddleWidth', 'paddle width (court widths)', 0.02], ['teamShrink', 'narrower paddles with more people'],
+  ['ballSize', 'ball size', 0.005], ['speedStart', 'serve speed', 0.05], ['speedUp', 'faster per hit (x)', 0.01],
+  ['speedMax', 'top speed', 0.1], ['maxAngle', 'max bounce angle (deg)', 5], ['depth', 'step back = paddle up the court'],
+  ['zone', 'depth zone (court lengths)', 0.02], ['smash', 'smash: lunge into the ball'],
+  ['multiball', 'second ball at rally (0 = off)', 1], ['winScore', 'points to win', 1],
+  ['squash', 'one end empty: squash against a wall'], ['smoothing', 'paddle smoothing (s)', 0.01]];
+const SIDE_FIELDS = [['reach', 'reach either side (mm)', 50], ['centre', 'centre offset (mm)', 50],
+                     ['mirror', 'mirror left/right'], ['near', 'near edge (mm)', 50], ['far', 'far edge (mm)', 50]];
+function field(parent, val, [key, label, step], send) {
+  const l = document.createElement('label'), i = document.createElement('input');
+  l.textContent = label;
+  if (typeof val === 'boolean') { i.type = 'checkbox'; i.checked = val; }
+  else { i.type = 'number'; i.step = step; i.value = val; }
+  i.onchange = () => send(key, i.type === 'checkbox' ? i.checked : +i.value);
+  l.appendChild(i); parent.appendChild(l);
+}
+function post(body) { fetch('/settings', { method: 'POST', body: JSON.stringify(body) }); }
+function buildPanel() {
+  if (!S) return;
+  for (const id of ['gameFields', 'aFields', 'bFields']) $(id).innerHTML = '';
+  GAME_FIELDS.forEach(f => field($('gameFields'), S.settings[f[0]], f, (k, v) => post({ game: { [k]: v } })));
+  for (const n of ['a', 'b'])
+    SIDE_FIELDS.forEach(f => field($(n + 'Fields'), S[n].cfg[f[0]], f, (k, v) => post({ sides: { [n]: { [k]: v } } })));
+  panelBuilt = true;
+}
+$('gear').onclick = () => { $('panel').hidden = !$('panel').hidden; panelBuilt = false; if (!$('panel').hidden) buildPanel(); };
+$('reset').onclick = () => fetch('/reset', { method: 'POST', body: '{}' });
+
+requestAnimationFrame(draw);
+</script>
+</body>
+</html>

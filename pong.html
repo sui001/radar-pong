@@ -19,6 +19,7 @@
   button { font: inherit; color: var(--fg); background: #222; border: 1px solid #fff; border-radius: 4px;
            padding: 3px 9px; cursor: pointer; }
   button.on { background: var(--ok); color: #000; }
+  select { font: inherit; color: var(--fg); background: #222; border: 1px solid #fff; border-radius: 4px; }
   #panel { position: absolute; right: 8px; bottom: 42px; width: min(420px, calc(100% - 16px)); max-height: calc(100% - 60px);
            overflow: auto; background: #111; border: 2px solid #fff; border-radius: 6px; padding: 10px 12px; }
   #panel[hidden] { display: none; }
@@ -37,6 +38,9 @@
   <span id="sb" class="b"></span>
   <span id="mode"></span>
   <span class="grow"></span>
+  <label>my end <select id="orient" aria-label="where your own end sits on screen">
+    <option value="bottom">bottom</option><option value="top">top</option>
+    <option value="left">left</option><option value="right">right</option></select></label>
   <button id="sound">Sound</button>
   <button id="gear">Settings</button>
 </div>
@@ -77,18 +81,45 @@ es.onmessage = e => {
 es.onerror = () => { S = null; };
 
 // ---------- court <-> screen ----------
-// court: x 0..1 across, y 0..L, A's end line at y = 0. Each view puts its own end at the top.
+// court: x 0..1 across, y 0..L, A's end line at y = 0. Each view first turns the court
+// into its own end's frame (fx: left to right as that end sees it, fy: 0 at its end
+// line), then puts its end where this page has chosen: bottom, top, left or right.
+const ORIENTS = ['bottom', 'top', 'left', 'right'];
+const orientKey = 'pong-orient-' + path;
+let orient = new URLSearchParams(location.search).get('own');
+if (!ORIENTS.includes(orient)) { try { orient = localStorage.getItem(orientKey); } catch (e) { orient = null; } }
+if (!ORIENTS.includes(orient)) orient = 'bottom';
+$('orient').value = orient;
+$('orient').onchange = () => {
+  orient = $('orient').value;
+  try { localStorage.setItem(orientKey, orient); } catch (e) { /* private window: just this visit */ }
+  setStack();
+};
+function setStack() { $('views').style.flexDirection = orient === 'left' || orient === 'right' ? 'column' : 'row'; }
+setStack();
+
+// own frame -> box units (width 1 across, len along), and back
+function orientFwd(fx, fy, len) {
+  return { top: [fx, fy], bottom: [fx, len - fy], left: [fy, fx], right: [len - fy, 1 - fx] }[orient];
+}
+function orientBack(sx, sy, len) {
+  return { top: [sx, sy], bottom: [sx, len - sy], left: [sy, sx], right: [1 - sy, len - sx] }[orient];
+}
+const sideways = () => orient === 'left' || orient === 'right';
+
 function layout(v) {
   const dpr = devicePixelRatio, W = v.c.clientWidth * dpr, H = v.c.clientHeight * dpr;
   if (v.c.width !== W || v.c.height !== H) { v.c.width = W; v.c.height = H; }
   const L = S ? S.L : 1.4, pad = 14 * dpr;
-  const s = Math.min((W - 2 * pad), (H - 2 * pad) / L);
-  v.tf = { s, ox: (W - s) / 2, oy: (H - s * L) / 2, L, W, H, dpr };
+  const bw = sideways() ? L : 1, bh = sideways() ? 1 : L;
+  const s = Math.min((W - 2 * pad) / bw, (H - 2 * pad) / bh);
+  v.tf = { s, ox: (W - s * bw) / 2, oy: (H - s * bh) / 2, L, W, H, dpr };
 }
 function toScreen(v, x, y) {
   const t = v.tf;
   if (v.side === 'b') { x = 1 - x; y = t.L - y; }
-  return [t.ox + x * t.s, t.oy + y * t.s];
+  const [sx, sy] = orientFwd(x, y, t.L);
+  return [t.ox + sx * t.s, t.oy + sy * t.s];
 }
 function rect(v, x0, y0, x1, y1, col) {
   const [ax, ay] = toScreen(v, x0, y0), [bx, by] = toScreen(v, x1, y1);
@@ -142,11 +173,11 @@ function draw() {
     g.strokeStyle = '#fff'; g.lineWidth = 2 * px;
     const [x0, y0] = toScreen(v, 0, 0), [x1, y1] = toScreen(v, 1, L);
     g.strokeRect(Math.min(x0, x1), Math.min(y0, y1), Math.abs(x1 - x0), Math.abs(y1 - y0));
-    for (let x = 0; x < 1; x += 0.05) rect(v, x + 0.01, L / 2 - 0.004, x + 0.035, L / 2 + 0.004, '#fff');
+    for (let x = 0; x < 0.99; x += 0.05) rect(v, x + 0.01, L / 2 - 0.004, x + 0.035, L / 2 + 0.004, '#fff');
     // depth zones, a thin line of each end's colour
     if (st.depth) for (const n of ['a', 'b']) {
       const y = n === 'a' ? S.endGap + st.zone * L : L - S.endGap - st.zone * L;
-      for (let x = 0; x < 1; x += 0.1) rect(v, x, y - 0.002, x + 0.04, y + 0.002, COL[n]);
+      for (let x = 0; x < 0.99; x += 0.1) rect(v, x, y - 0.002, x + 0.04, y + 0.002, COL[n]);
     }
     // scores: each end's number in its own half
     const big = Math.max(4, Math.round(t.s / 45));
@@ -189,18 +220,29 @@ function draw() {
 }
 
 // a small top-down of this end's sensor: sensor at the top, the playing width boxed
+// turned the same way as the court, so the sensor sits on the same edge as your end
 function drawRadar(v, n) {
-  const g = v.g, t = v.tf, px = t.dpr, side = S[n], cfg = side.cfg;
-  const w = Math.min(150 * px, t.W * 0.3), h = w * 0.6, ox = t.W - w - 6 * px, oy = 6 * px;
-  const span = Math.max(cfg.reach * 2.6, 4000), sc = w / span, depth = Math.max(cfg.far * 1.25, 3500);
-  const X = x => ox + w / 2 + x * sc * (cfg.mirror ? -1 : 1), Y = y => oy + y * (h / depth);
-  g.fillStyle = '#000'; g.fillRect(ox, oy, w, h);
-  g.strokeStyle = '#fff'; g.lineWidth = 1 * px; g.strokeRect(ox, oy, w, h);
+  const g = v.g, t = v.tf, px = t.dpr, side = S[n], cfg = side.cfg, LEN = 0.6;
+  const k = Math.min(150 * px, t.W * 0.3, t.H * 0.3);       // box units -> pixels
+  const bw = (sideways() ? LEN : 1) * k, bh = (sideways() ? 1 : LEN) * k;
+  const ox = orient === 'left' ? 6 * px : t.W - bw - 6 * px;
+  const oy = orient === 'top' ? 6 * px : t.H - bh - 6 * px;
+  const span = Math.max(cfg.reach * 2.6, 4000), depth = Math.max(cfg.far * 1.25, 3500);
+  const P = (x, y) => {                                     // radar mm -> screen
+    const fx = 0.5 + (cfg.mirror ? -x : x) / span, fy = Math.min(y, depth) / depth * LEN;
+    const [sx, sy] = orientFwd(fx, fy, LEN);
+    return [ox + sx * k, oy + sy * k];
+  };
+  g.fillStyle = '#000'; g.fillRect(ox, oy, bw, bh);
+  g.strokeStyle = '#fff'; g.lineWidth = 1 * px; g.strokeRect(ox, oy, bw, bh);
+  const [ax, ay] = P(cfg.centre - cfg.reach, cfg.near), [bx, by] = P(cfg.centre + cfg.reach, cfg.far);
   g.strokeStyle = COL[n]; g.lineWidth = 2 * px;
-  g.strokeRect(X(cfg.centre - cfg.reach), Y(cfg.near), X(cfg.centre + cfg.reach) - X(cfg.centre - cfg.reach), Y(cfg.far) - Y(cfg.near));
-  g.fillStyle = '#fff'; g.fillRect(ox + w / 2 - 4 * px, oy, 8 * px, 3 * px);
+  g.strokeRect(Math.min(ax, bx), Math.min(ay, by), Math.abs(bx - ax), Math.abs(by - ay));
+  const [sx, sy] = P(0, 0);
+  g.fillStyle = '#fff'; g.fillRect(sx - 4 * px, sy - 4 * px, 8 * px, 8 * px);   // the sensor
   for (const [x, y] of side.raw) {
-    g.beginPath(); g.arc(X(x), Y(Math.min(y, depth)), 3.5 * px, 0, 7); g.fillStyle = COL[n]; g.fill();
+    const [dx, dy] = P(x, y);
+    g.beginPath(); g.arc(dx, dy, 3.5 * px, 0, 7); g.fillStyle = COL[n]; g.fill();
   }
 }
 
@@ -246,7 +288,7 @@ for (const v of views) {
   const at = e => {
     const r = v.c.getBoundingClientRect(), t = v.tf;
     const sx = (e.clientX - r.left) * t.dpr, sy = (e.clientY - r.top) * t.dpr;
-    const u = (sx - t.ox) / t.s, y = (sy - t.oy) / t.s;   // in this view's own frame: own end at top
+    const [u, y] = orientBack((sx - t.ox) / t.s, (sy - t.oy) / t.s, t.L);   // back to this end's own frame
     const d = S && S.settings.depth ? (y - S.endGap) / (S.settings.zone * S.L) : 0;
     hand[v.side] = { u: Math.max(0, Math.min(1, u)), d: Math.max(0, Math.min(1, d)), t: performance.now() };
   };

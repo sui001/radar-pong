@@ -5,7 +5,7 @@ to move it, step away from the sensor to push it up the court. The sensors can
 be in different rooms: each end only needs a radar stream and a screen.
 
     python pong.py --a sim --b sim                     # no sensors, two fake players
-    python pong.py --a http://100.68.139.69:8090/stream#0 --b http://100.68.139.69:8090/stream#1
+    python pong.py --a http://plotterpi:8090/stream#0 --b http://plotterpi:8090/stream#1
     python pong.py --a http://roomA:8095/targets --b http://roomB:8095/targets
 
     --a / --b   where each end's people come from:
@@ -36,7 +36,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 L = 1.4             # court length; width is 1. A's end line is y = 0, B's is y = L
@@ -539,7 +539,7 @@ def main():
 
     print(f"=== Radar Pong v{VERSION} ===")
     print("Two presence radars, two ends of one court; every person is a paddle")
-    print("Local repo ~/radar-pong (not on GitHub yet)")
+    print("https://github.com/sui001/radar-pong")
 
     srcs = {"a": parse_source(args.a), "b": parse_source(args.b)}
     GAME = Game(Side("a", args.a), Side("b", args.b))
@@ -558,7 +558,12 @@ def main():
     threading.Thread(target=GAME.run, daemon=True).start()
     threading.Thread(target=fps_counter, daemon=True).start()
 
-    srv = ThreadingHTTPServer((args.listen, args.http), Handler)
+    try:
+        srv = ThreadingHTTPServer((args.listen, args.http), Handler)
+    except OSError as e:
+        raise SystemExit(f"cannot open port {args.http}: {e}\n"
+                         "Windows reserves ranges of ports (netsh interface ipv4 show excludedportrange "
+                         "protocol=tcp); pick another with --http, e.g. --http 5210")
     srv.daemon_threads = True
     print(f"A: {args.a}   B: {args.b}")
     print(f"open http://localhost:{args.http}/split  (or /a, /b, /watch)")
